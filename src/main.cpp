@@ -10,15 +10,11 @@
 #include <ImageView.h>
 
 #include <algorithm>
-#include <cctype>
-#include <cwctype>
-#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
 #include <iterator>
 #include <string>
-#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -77,7 +73,9 @@ bool gEnterDown = false;
 bool gEscapeDown = false;
 bool gCustomHotkeyKeyDown = false;
 bool gSuppressHotkeyKeyUp = false;
-bool gSuppressPrintScreenInSettings = false;
+UINT gSettingsCapturedVk = 0;
+bool gRecordingLeftWinDown = false;
+bool gRecordingRightWinDown = false;
 HFONT gButtonFont = nullptr;
 
 std::wstring FormatHotkey(UINT modifiers, UINT vk);
@@ -304,14 +302,18 @@ std::wstring GetKeyName(UINT vk)
 
 std::wstring FormatHotkey(UINT modifiers, UINT vk)
 {
-    if (vk == 0)
-        return L"Нажмите сочетание клавиш";
-
     std::wstring result;
     if (modifiers & MOD_CONTROL) result += L"Ctrl + ";
     if (modifiers & MOD_ALT)     result += L"Alt + ";
     if (modifiers & MOD_SHIFT)   result += L"Shift + ";
     if (modifiers & MOD_WIN)     result += L"Win + ";
+
+    if (vk == 0) {
+        if (result.empty())
+            return L"Нажмите сочетание клавиш...";
+        return result + L"нажмите клавишу";
+    }
+
     result += GetKeyName(vk);
     return result;
 }
@@ -464,35 +466,61 @@ bool RegisterStartupHotkey()
     return false;
 }
 
+UINT GetModifiersForKeyboardEvent(UINT eventVk, bool eventDown)
+{
+    auto pressed = [eventVk, eventDown](UINT generic, UINT left, UINT right) {
+        bool value = (GetAsyncKeyState(generic) & 0x8000) != 0 ||
+                     (GetAsyncKeyState(left) & 0x8000) != 0 ||
+                     (GetAsyncKeyState(right) & 0x8000) != 0;
+        if (eventVk == generic || eventVk == left || eventVk == right)
+            value = eventDown;
+        return value;
+    };
+
+    UINT modifiers = 0;
+    if (pressed(VK_CONTROL, VK_LCONTROL, VK_RCONTROL)) modifiers |= MOD_CONTROL;
+    if (pressed(VK_MENU, VK_LMENU, VK_RMENU)) modifiers |= MOD_ALT;
+    if (pressed(VK_SHIFT, VK_LSHIFT, VK_RSHIFT)) modifiers |= MOD_SHIFT;
+
+    bool winDown = gRecordingLeftWinDown || gRecordingRightWinDown ||
+                   (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+    if (eventVk == VK_LWIN)
+        winDown = eventDown || gRecordingRightWinDown;
+    else if (eventVk == VK_RWIN)
+        winDown = eventDown || gRecordingLeftWinDown;
+    if (winDown) modifiers |= MOD_WIN;
+    return modifiers;
+}
+
 LRESULT CALLBACK HotkeyBoxWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message) {
     case WM_GETDLGCODE:
         return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
 
+    case WM_SETFOCUS:
     case WM_LBUTTONDOWN:
+        // Start a fresh recording session as soon as the user enters the field.
+        gPendingHotkeyModifiers = 0;
+        gPendingHotkeyVk = 0;
+        gSettingsCapturedVk = 0;
+        gRecordingLeftWinDown = false;
+        gRecordingRightWinDown = false;
         SetFocus(hwnd);
+        InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN: {
+        // Fallback for keyboards that deliver ordinary key messages rather
+        // than being intercepted by the low-level hook.
         const UINT vk = static_cast<UINT>(wParam);
-        // Print Screen commonly does not generate a normal WM_KEYDOWN for the
-        // focused control. It is recorded by LowLevelKeyboardProc instead.
-        if (vk == VK_SNAPSHOT || IsModifierKey(vk) ||
-            vk == VK_ESCAPE || vk == VK_RETURN)
-            return 0;
-
-        UINT modifiers = 0;
-        if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= MOD_CONTROL;
-        if (GetKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
-        if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
-        if ((GetAsyncKeyState(VK_LWIN) & 0x8000) ||
-            (GetAsyncKeyState(VK_RWIN) & 0x8000)) modifiers |= MOD_WIN;
-
-        gPendingHotkeyModifiers = modifiers;
-        gPendingHotkeyVk = vk;
-        InvalidateRect(hwnd, nullptr, TRUE);
+        if (!IsModifierKey(vk) && vk != VK_ESCAPE && vk != VK_RETURN) {
+            gPendingHotkeyModifiers = GetModifiersForKeyboardEvent(vk, true);
+            gPendingHotkeyVk = vk;
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
         return 0;
     }
 
@@ -514,7 +542,8 @@ LRESULT CALLBACK HotkeyBoxWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
         const std::wstring label = FormatHotkey(gPendingHotkeyModifiers, gPendingHotkeyVk);
-        DrawTextW(dc, label.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(dc, label.c_str(), -1, &rc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         if (GetFocus() == hwnd) {
             RECT focus = rc;
             InflateRect(&focus, -2, -3);
@@ -533,38 +562,39 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
     case WM_CREATE: {
         gSettingsWindow = hwnd;
         CreateWindowExW(0, L"STATIC", L"Сейчас используется:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            22, 18, 510, 22, hwnd, nullptr, gInstance, nullptr);
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            24, 20, 600, 24, hwnd, nullptr, gInstance, nullptr);
         const std::wstring current = gRegisteredHotkeyId
             ? FormatHotkey(gHotkeyModifiers, gHotkeyVk)
             : L"Не назначено";
         CreateWindowExW(0, L"STATIC", current.c_str(),
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            22, 43, 510, 26, hwnd, nullptr, gInstance, nullptr);
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            24, 49, 600, 28, hwnd, nullptr, gInstance, nullptr);
         CreateWindowExW(0, L"STATIC", L"Нажмите нужное сочетание в поле ниже:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            22, 82, 510, 22, hwnd, nullptr, gInstance, nullptr);
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            24, 91, 600, 25, hwnd, nullptr, gInstance, nullptr);
         gHotkeyBox = CreateWindowExW(0, kHotkeyBoxClass, L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            22, 108, 510, 42,
+            24, 122, 600, 48,
             hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsHotkeyBox)),
             gInstance, nullptr);
         CreateWindowExW(0, L"STATIC",
-            L"Print Screen можно выбрать отдельно или вместе с Ctrl, Shift, Alt и Win.\r\n"
+            L"Щёлкните поле и нажмите клавиши одновременно.\r\n"
+            L"Print Screen можно использовать отдельно или с Ctrl, Shift, Alt и Win.\r\n"
             L"Для других клавиш нужен модификатор. Esc и Enter не назначаются.",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            22, 164, 510, 48, hwnd, nullptr, gInstance, nullptr);
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            24, 184, 600, 72, hwnd, nullptr, gInstance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"По умолчанию: Print Screen",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            22, 232, 205, 34, hwnd,
+            24, 302, 245, 38, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsDefault)), gInstance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"Сохранить",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            340, 232, 90, 34, hwnd,
+            416, 302, 100, 38, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsSave)), gInstance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"Отмена",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-            440, 232, 92, 34, hwnd,
+            526, 302, 100, 38, hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCancel)), gInstance, nullptr);
 
         // Use the standard Windows dialog font for consistent text metrics.
@@ -621,7 +651,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
     case WM_DESTROY:
         gSettingsWindow = nullptr;
         gHotkeyBox = nullptr;
-        gSuppressPrintScreenInSettings = false;
+        gSettingsCapturedVk = 0;
+        gRecordingLeftWinDown = false;
+        gRecordingRightWinDown = false;
         return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -667,8 +699,8 @@ void ShowSettingsWindow()
 
     gPendingHotkeyModifiers = gHotkeyModifiers;
     gPendingHotkeyVk = gHotkeyVk;
-    constexpr int windowWidth = 580;
-    constexpr int windowHeight = 330;
+    constexpr int windowWidth = 660;
+    constexpr int windowHeight = 420;
     POINT cursor{};
     GetCursorPos(&cursor);
     HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
@@ -819,328 +851,6 @@ std::wstring Utf8ToWide(const std::string& text)
     return result;
 }
 
-std::string WideToUtf8(const std::wstring& text)
-{
-    if (text.empty())
-        return {};
-
-    const int inputLength = static_cast<int>(text.size());
-    int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-                                       text.data(), inputLength, nullptr, 0,
-                                       nullptr, nullptr);
-    DWORD flags = WC_ERR_INVALID_CHARS;
-    if (required == 0) {
-        flags = 0;
-        required = WideCharToMultiByte(CP_UTF8, flags, text.data(), inputLength,
-                                       nullptr, 0, nullptr, nullptr);
-    }
-    if (required <= 0)
-        return {};
-
-    std::string result(static_cast<size_t>(required), '\0');
-    if (WideCharToMultiByte(CP_UTF8, flags, text.data(), inputLength,
-                            result.data(), required, nullptr, nullptr) <= 0)
-        return {};
-    return result;
-}
-
-std::wstring ToLowerCopy(std::wstring value)
-{
-    std::transform(value.begin(), value.end(), value.begin(),
-        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-    return value;
-}
-
-bool IsHtmlTagName(std::wstring_view name)
-{
-    static const std::unordered_set<std::wstring> tags = {
-        L"a", L"b", L"strong", L"i", L"em", L"u", L"s", L"strike", L"del",
-        L"sub", L"sup", L"p", L"div", L"span", L"br", L"hr", L"h1", L"h2",
-        L"h3", L"h4", L"h5", L"h6", L"ul", L"ol", L"li", L"blockquote",
-        L"pre", L"code", L"table", L"thead", L"tbody", L"tfoot", L"tr", L"td",
-        L"th", L"font", L"center", L"html", L"head", L"body", L"title", L"meta",
-        L"style", L"script"
-    };
-    return tags.find(std::wstring(name)) != tags.end();
-}
-
-bool LooksLikeHtml(const std::wstring& text)
-{
-    size_t pos = 0;
-    while ((pos = text.find(L'<', pos)) != std::wstring::npos) {
-        size_t p = pos + 1;
-        if (p < text.size() && text[p] == L'/') ++p;
-        while (p < text.size() && iswspace(text[p])) ++p;
-        const size_t begin = p;
-        while (p < text.size() && (iswalnum(text[p]) || text[p] == L'-')) ++p;
-        if (p > begin && IsHtmlTagName(std::wstring_view(text).substr(begin, p - begin)))
-            return true;
-        pos++;
-    }
-    return false;
-}
-
-std::wstring EscapeHtmlText(std::wstring_view text)
-{
-    std::wstring result;
-    result.reserve(text.size() + 32);
-    for (size_t i = 0; i < text.size(); ++i) {
-        const wchar_t ch = text[i];
-        switch (ch) {
-        case L'&': result += L"&amp;"; break;
-        case L'<': result += L"&lt;"; break;
-        case L'>': result += L"&gt;"; break;
-        case L'\r':
-            if (i + 1 < text.size() && text[i + 1] == L'\n') ++i;
-            result += L"<br>\r\n";
-            break;
-        case L'\n': result += L"<br>\r\n"; break;
-        default: result.push_back(ch); break;
-        }
-    }
-    return result;
-}
-
-std::wstring EscapeHtmlAttribute(std::wstring_view value)
-{
-    std::wstring result;
-    result.reserve(value.size() + 8);
-    for (wchar_t ch : value) {
-        switch (ch) {
-        case L'&': result += L"&amp;"; break;
-        case L'"': result += L"&quot;"; break;
-        case L'<': result += L"&lt;"; break;
-        case L'>': result += L"&gt;"; break;
-        default: result.push_back(ch); break;
-        }
-    }
-    return result;
-}
-
-bool IsAllowedHtmlTag(std::wstring_view tag)
-{
-    static const std::unordered_set<std::wstring> allowed = {
-        L"a", L"b", L"strong", L"i", L"em", L"u", L"s", L"strike", L"del",
-        L"sub", L"sup", L"p", L"div", L"span", L"br", L"hr", L"h1", L"h2",
-        L"h3", L"h4", L"h5", L"h6", L"ul", L"ol", L"li", L"blockquote",
-        L"pre", L"code", L"table", L"thead", L"tbody", L"tfoot", L"tr", L"td",
-        L"th", L"font", L"center", L"style"
-    };
-    return allowed.find(std::wstring(tag)) != allowed.end();
-}
-
-bool IsDangerousHtmlTag(std::wstring_view tag)
-{
-    return tag == L"script" || tag == L"iframe" ||
-           tag == L"object" || tag == L"embed" || tag == L"svg" ||
-           tag == L"math" || tag == L"form" || tag == L"template" ||
-           tag == L"noscript" || tag == L"head";
-}
-
-bool IsSafeCss(std::wstring_view value)
-{
-    const std::wstring lower = ToLowerCopy(std::wstring(value));
-    return lower.find(L"url(") == std::wstring::npos &&
-           lower.find(L"expression") == std::wstring::npos &&
-           lower.find(L"javascript:") == std::wstring::npos &&
-           lower.find(L"behavior:") == std::wstring::npos &&
-           lower.find(L"-moz-binding") == std::wstring::npos &&
-           lower.find(L"@import") == std::wstring::npos;
-}
-
-bool IsSafeLink(std::wstring_view value)
-{
-    const std::wstring lower = ToLowerCopy(std::wstring(value));
-    return lower.rfind(L"https://", 0) == 0 ||
-           lower.rfind(L"http://", 0) == 0 ||
-           lower.rfind(L"mailto:", 0) == 0 ||
-           (!value.empty() && value.front() == L'#');
-}
-
-// Keep common formatting tags and harmless attributes for Word while
-// stripping active content, event handlers, remote resources and unsafe URLs.
-std::wstring SanitizeHtmlFragment(const std::wstring& input)
-{
-    std::wstring output;
-    output.reserve(input.size());
-    size_t pos = 0;
-
-    while (pos < input.size()) {
-        const size_t lt = input.find(L'<', pos);
-        if (lt == std::wstring::npos) {
-            output.append(input, pos, std::wstring::npos);
-            break;
-        }
-        output.append(input, pos, lt - pos);
-
-        if (input.compare(lt, 4, L"<!--") == 0) {
-            const size_t commentEnd = input.find(L"-->", lt + 4);
-            pos = commentEnd == std::wstring::npos ? input.size() : commentEnd + 3;
-            continue;
-        }
-
-        size_t gt = lt + 1;
-        wchar_t quote = 0;
-        for (; gt < input.size(); ++gt) {
-            const wchar_t ch = input[gt];
-            if (quote) {
-                if (ch == quote) quote = 0;
-            } else if (ch == L'"' || ch == L'\'') {
-                quote = ch;
-            } else if (ch == L'>') {
-                break;
-            }
-        }
-        if (gt >= input.size()) {
-            output += L"&lt;";
-            pos = lt + 1;
-            continue;
-        }
-
-        size_t p = lt + 1;
-        while (p < gt && iswspace(input[p])) ++p;
-        bool closing = false;
-        if (p < gt && input[p] == L'/') { closing = true; ++p; }
-        while (p < gt && iswspace(input[p])) ++p;
-        const size_t nameStart = p;
-        while (p < gt && (iswalnum(input[p]) || input[p] == L'-')) ++p;
-        if (p == nameStart) {
-            pos = gt + 1;
-            continue;
-        }
-
-        const std::wstring tag = ToLowerCopy(input.substr(nameStart, p - nameStart));
-        if (tag == L"style" && !closing) {
-            const std::wstring closeToken = L"</style";
-            const std::wstring lowerTail = ToLowerCopy(input.substr(gt + 1));
-            const size_t closePos = lowerTail.find(closeToken);
-            if (closePos != std::wstring::npos) {
-                const std::wstring css = input.substr(gt + 1, closePos);
-                const size_t closeGt = input.find(L'>', gt + 1 + closePos);
-                if (IsSafeCss(css))
-                    output += L"<style>" + css + L"</style>";
-                pos = closeGt == std::wstring::npos ? input.size() : closeGt + 1;
-                continue;
-            }
-            pos = input.size();
-            continue;
-        }
-        if (IsDangerousHtmlTag(tag)) {
-            if (!closing && tag != L"head") {
-                const std::wstring closeToken = L"</" + tag;
-                const std::wstring lowerTail = ToLowerCopy(input.substr(gt + 1));
-                const size_t closePos = lowerTail.find(closeToken);
-                if (closePos != std::wstring::npos) {
-                    const size_t closeGt = input.find(L'>', gt + 1 + closePos);
-                    pos = closeGt == std::wstring::npos ? input.size() : closeGt + 1;
-                    continue;
-                }
-            }
-            pos = gt + 1;
-            continue;
-        }
-
-        if (!IsAllowedHtmlTag(tag)) {
-            pos = gt + 1;
-            continue;
-        }
-
-        output += L'<';
-        if (closing) output += L'/';
-        output += tag;
-
-        if (!closing) {
-            static const std::unordered_set<std::wstring> allowedAttrs = {
-                L"style", L"href", L"title", L"align", L"valign", L"bgcolor",
-                L"color", L"face", L"size", L"colspan", L"rowspan", L"width",
-                L"height", L"border", L"start", L"dir", L"lang", L"class", L"id"
-            };
-            while (p < gt) {
-                while (p < gt && (iswspace(input[p]) || input[p] == L'/')) ++p;
-                if (p >= gt) break;
-                const size_t attrStart = p;
-                while (p < gt && !iswspace(input[p]) && input[p] != L'=' && input[p] != L'/' && input[p] != L'>') ++p;
-                if (p == attrStart) { ++p; continue; }
-                const std::wstring attr = ToLowerCopy(input.substr(attrStart, p - attrStart));
-                while (p < gt && iswspace(input[p])) ++p;
-                std::wstring value;
-                if (p < gt && input[p] == L'=') {
-                    ++p;
-                    while (p < gt && iswspace(input[p])) ++p;
-                    if (p < gt && (input[p] == L'"' || input[p] == L'\'')) {
-                        const wchar_t q = input[p++];
-                        const size_t valueStart = p;
-                        while (p < gt && input[p] != q) ++p;
-                        value = input.substr(valueStart, p - valueStart);
-                        if (p < gt) ++p;
-                    } else {
-                        const size_t valueStart = p;
-                        while (p < gt && !iswspace(input[p]) && input[p] != L'>') ++p;
-                        value = input.substr(valueStart, p - valueStart);
-                    }
-                }
-
-                if (allowedAttrs.find(attr) == allowedAttrs.end())
-                    continue;
-                if (attr == L"href" && (tag != L"a" || !IsSafeLink(value)))
-                    continue;
-                if (attr == L"style" && !IsSafeCss(value))
-                    continue;
-                if (value.empty() && attr != L"style")
-                    continue;
-                output += L' ';
-                output += attr;
-                output += L"=\"";
-                output += EscapeHtmlAttribute(value);
-                output += L'"';
-            }
-        }
-
-        output += L'>';
-        pos = gt + 1;
-    }
-    return output;
-}
-
-std::string MakeCfHtml(const std::wstring& text)
-{
-    std::wstring fragmentWide;
-    if (LooksLikeHtml(text))
-        fragmentWide = SanitizeHtmlFragment(text);
-    else
-        fragmentWide = EscapeHtmlText(text);
-
-    std::string fragment = WideToUtf8(fragmentWide);
-    const std::string docPrefix = "<html><body><!--StartFragment-->";
-    const std::string docSuffix = "<!--EndFragment--></body></html>";
-    const std::string document = docPrefix + fragment + docSuffix;
-
-    auto offset = [](size_t value) {
-        char buffer[32]{};
-        std::snprintf(buffer, sizeof(buffer), "%010zu", value);
-        return std::string(buffer);
-    };
-
-    const std::string headerTemplate =
-        "Version:1.0\r\n"
-        "StartHTML:0000000000\r\n"
-        "EndHTML:0000000000\r\n"
-        "StartFragment:0000000000\r\n"
-        "EndFragment:0000000000\r\n";
-    const size_t startHtml = headerTemplate.size();
-    const size_t startFragment = startHtml + docPrefix.size();
-    const size_t endFragment = startFragment + fragment.size();
-    const size_t endHtml = startHtml + document.size();
-
-    const std::string header =
-        "Version:1.0\r\n"
-        "StartHTML:" + offset(startHtml) + "\r\n" +
-        "EndHTML:" + offset(endHtml) + "\r\n" +
-        "StartFragment:" + offset(startFragment) + "\r\n" +
-        "EndFragment:" + offset(endFragment) + "\r\n";
-    return header + document;
-}
-
 HGLOBAL CreateClipboardMemory(const void* source, SIZE_T bytes)
 {
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
@@ -1156,21 +866,15 @@ HGLOBAL CreateClipboardMemory(const void* source, SIZE_T bytes)
     return memory;
 }
 
-bool CopyTextAndHtmlToClipboard(HWND owner, const std::wstring& text)
+bool CopyTextToClipboard(HWND owner, const std::wstring& text)
 {
     const SIZE_T textBytes = (text.size() + 1) * sizeof(wchar_t);
     HGLOBAL textMemory = CreateClipboardMemory(text.c_str(), textBytes);
     if (!textMemory)
         return false;
 
-    const std::string html = MakeCfHtml(text);
-    const UINT htmlFormat = RegisterClipboardFormatW(L"HTML Format");
-    HGLOBAL htmlMemory = htmlFormat
-        ? CreateClipboardMemory(html.c_str(), html.size() + 1) : nullptr;
-
     if (!OpenClipboard(owner)) {
         GlobalFree(textMemory);
-        if (htmlMemory) GlobalFree(htmlMemory);
         return false;
     }
 
@@ -1179,18 +883,9 @@ bool CopyTextAndHtmlToClipboard(HWND owner, const std::wstring& text)
     if (textOk)
         textMemory = nullptr; // Ownership transferred to the clipboard.
 
-    bool htmlOk = false;
-    if (htmlMemory) {
-        htmlOk = SetClipboardData(htmlFormat, htmlMemory) != nullptr;
-        if (htmlOk)
-            htmlMemory = nullptr; // Ownership transferred to the clipboard.
-    }
-
     CloseClipboard();
-    if (textMemory) GlobalFree(textMemory);
-    if (htmlMemory) GlobalFree(htmlMemory);
-
-    // Plain text remains available even if an application rejects CF_HTML.
+    if (textMemory)
+        GlobalFree(textMemory);
     return textOk;
 }
 
@@ -1242,7 +937,7 @@ void DecodeSelection(HWND owner)
             clipboardText += value;
         }
 
-        if (!CopyTextAndHtmlToClipboard(owner, clipboardText)) {
+        if (!CopyTextToClipboard(owner, clipboardText)) {
             MessageBoxW(owner,
                 L"QR-код распознан, но Windows не разрешила записать данные в буфер обмена.",
                 L"QR Screen", MB_OK | MB_ICONERROR);
@@ -1251,7 +946,7 @@ void DecodeSelection(HWND owner)
 
         const std::wstring message = L"Найдено QR-кодов: " +
             std::to_wstring(decodedValues.size()) +
-            L".\nТекст и HTML скопированы в буфер обмена.";
+            L".\nТекст скопирован в буфер обмена.";
         MessageBoxW(owner, message.c_str(), L"QR Screen",
                     MB_OK | MB_ICONINFORMATION);
 
@@ -1441,34 +1136,63 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
         const bool keyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
         const bool keyUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
-        // Print Screen is special: many Windows configurations do not send
-        // WM_KEYDOWN to a focused edit control. Capture it from the low-level
-        // hook while (and only while) the shortcut field has focus.
-        if (gSettingsWindow && gHotkeyBox && GetFocus() == gHotkeyBox &&
-            key->vkCode == VK_SNAPSHOT) {
-            auto recordPrintScreen = []() {
-                UINT modifiers = 0;
-                if (GetAsyncKeyState(VK_CONTROL) & 0x8000) modifiers |= MOD_CONTROL;
-                if (GetAsyncKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
-                if (GetAsyncKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
-                if ((GetAsyncKeyState(VK_LWIN) & 0x8000) ||
-                    (GetAsyncKeyState(VK_RWIN) & 0x8000)) modifiers |= MOD_WIN;
-
-                gPendingHotkeyModifiers = modifiers;
-                gPendingHotkeyVk = VK_SNAPSHOT;
-                if (gHotkeyBox)
-                    PostMessageW(gHotkeyBox, kHotkeyRecordedMessage, 0, 0);
-            };
+        // While the shortcut field is focused, record every key directly in
+        // the low-level hook. This gives immediate visual feedback and handles
+        // Print Screen even on keyboards that do not send WM_KEYDOWN to controls.
+        const bool recordingShortcut = gSettingsWindow && gHotkeyBox &&
+            GetForegroundWindow() == gSettingsWindow && GetFocus() == gHotkeyBox;
+        if (recordingShortcut) {
+            const UINT vk = key->vkCode;
             if (keyDown) {
-                recordPrintScreen();
-                gSuppressPrintScreenInSettings = true;
-                return 1; // Do not trigger Windows' own Print Screen action.
+                if (vk == VK_LWIN) gRecordingLeftWinDown = true;
+                if (vk == VK_RWIN) gRecordingRightWinDown = true;
+
+                const UINT modifiers = GetModifiersForKeyboardEvent(vk, true);
+                if (IsModifierKey(vk)) {
+                    gPendingHotkeyModifiers = modifiers;
+                    gPendingHotkeyVk = 0;
+                    if (gHotkeyBox)
+                        PostMessageW(gHotkeyBox, kHotkeyRecordedMessage, 0, 0);
+                    // Let Ctrl/Alt/Shift reach Windows so GetAsyncKeyState sees
+                    // them for the following key. Suppress Win to avoid opening Start.
+                    if (vk == VK_LWIN || vk == VK_RWIN)
+                        return 1;
+                    return CallNextHookEx(gKeyboardHook, code, wParam, lParam);
+                }
+
+                if (vk != VK_ESCAPE && vk != VK_RETURN) {
+                    gPendingHotkeyModifiers = modifiers;
+                    gPendingHotkeyVk = vk;
+                    gSettingsCapturedVk = vk;
+                    if (gHotkeyBox)
+                        PostMessageW(gHotkeyBox, kHotkeyRecordedMessage, 0, 0);
+                }
+                return 1;
             }
             if (keyUp) {
-                // Some keyboards/drivers report Print Screen as a key-up only.
-                if (!gSuppressPrintScreenInSettings)
-                    recordPrintScreen();
-                gSuppressPrintScreenInSettings = false;
+                if (vk == VK_LWIN) gRecordingLeftWinDown = false;
+                if (vk == VK_RWIN) gRecordingRightWinDown = false;
+
+                if (IsModifierKey(vk) && gPendingHotkeyVk == 0) {
+                    gPendingHotkeyModifiers = GetModifiersForKeyboardEvent(vk, false);
+                    if (gHotkeyBox)
+                        PostMessageW(gHotkeyBox, kHotkeyRecordedMessage, 0, 0);
+                } else if (!IsModifierKey(vk) && vk != VK_ESCAPE && vk != VK_RETURN &&
+                           gSettingsCapturedVk != vk) {
+                    // A few keyboard drivers report Print Screen only on key-up.
+                    // Record it here as a fallback, without delaying normal key-down capture.
+                    gPendingHotkeyModifiers = GetModifiersForKeyboardEvent(vk, false);
+                    gPendingHotkeyVk = vk;
+                    if (gHotkeyBox)
+                        PostMessageW(gHotkeyBox, kHotkeyRecordedMessage, 0, 0);
+                }
+                if (gSettingsCapturedVk == vk)
+                    gSettingsCapturedVk = 0;
+
+                if (vk == VK_LWIN || vk == VK_RWIN)
+                    return 1;
+                if (IsModifierKey(vk))
+                    return CallNextHookEx(gKeyboardHook, code, wParam, lParam);
                 return 1;
             }
         }
