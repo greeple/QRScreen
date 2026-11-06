@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <iterator>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -22,6 +23,8 @@ namespace {
 
 constexpr wchar_t kMainClass[] = L"QRScreen.MainWindow";
 constexpr wchar_t kSelectorClass[] = L"QRScreen.RegionSelector";
+constexpr wchar_t kSettingsClass[] = L"QRScreen.SettingsWindow";
+constexpr wchar_t kHotkeyBoxClass[] = L"QRScreen.HotkeyBox";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCaptureMessage = WM_APP + 2;
 constexpr UINT kDecodeMessage = WM_APP + 3;
@@ -29,14 +32,28 @@ constexpr UINT kCancelMessage = WM_APP + 4;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kMenuCapture = 1001;
 constexpr UINT kMenuExit = 1002;
+constexpr UINT kMenuSettings = 1003;
 constexpr UINT kButtonRecognize = 2001;
+constexpr UINT kSettingsHotkeyBox = 2101;
+constexpr UINT kSettingsSave = 2102;
+constexpr UINT kSettingsCancel = 2103;
+constexpr UINT kSettingsDefault = 2104;
+constexpr UINT kHotkeyIdA = 3001;
+constexpr UINT kHotkeyIdB = 3002;
 
 HINSTANCE gInstance = nullptr;
 HWND gMainWindow = nullptr;
 HWND gSelector = nullptr;
 HWND gRecognizeButton = nullptr;
+HWND gSettingsWindow = nullptr;
+HWND gHotkeyBox = nullptr;
 HHOOK gKeyboardHook = nullptr;
 HANDLE gSingleInstanceMutex = nullptr;
+UINT gRegisteredHotkeyId = 0;
+UINT gHotkeyModifiers = 0;
+UINT gHotkeyVk = VK_SNAPSHOT;
+UINT gPendingHotkeyModifiers = 0;
+UINT gPendingHotkeyVk = VK_SNAPSHOT;
 
 HBITMAP gScreenBitmap = nullptr;
 HDC gScreenDC = nullptr;
@@ -51,10 +68,14 @@ POINT gDragStart{};
 RECT gSelection{};
 bool gDragging = false;
 bool gHasSelection = false;
-bool gPrintScreenDown = false;
 bool gEnterDown = false;
 bool gEscapeDown = false;
+bool gCustomHotkeyKeyDown = false;
+bool gSuppressHotkeyKeyUp = false;
 HFONT gButtonFont = nullptr;
+
+std::wstring FormatHotkey(UINT modifiers, UINT vk);
+void ShowSettingsWindow();
 
 RECT NormalizeRect(POINT a, POINT b)
 {
@@ -178,7 +199,11 @@ void ShowTrayMenu()
     if (!menu)
         return;
 
-    AppendMenuW(menu, MF_STRING, kMenuCapture, L"Распознать QR-код...  (Print Screen)");
+    std::wstring captureLabel = L"Распознать QR-код...";
+    if (gRegisteredHotkeyId)
+        captureLabel += L"  (" + FormatHotkey(gHotkeyModifiers, gHotkeyVk) + L")";
+    AppendMenuW(menu, MF_STRING, kMenuCapture, captureLabel.c_str());
+    AppendMenuW(menu, MF_STRING, kMenuSettings, L"Настройки сочетания клавиш...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"Выход");
 
@@ -193,6 +218,8 @@ void ShowTrayMenu()
 
     if (command == kMenuCapture)
         PostMessageW(gMainWindow, kCaptureMessage, 0, 0);
+    else if (command == kMenuSettings)
+        ShowSettingsWindow();
     else if (command == kMenuExit)
         PostMessageW(gMainWindow, WM_CLOSE, 0, 0);
 }
@@ -217,6 +244,413 @@ void RemoveTrayIcon()
     nid.hWnd = gMainWindow;
     nid.uID = kTrayIconId;
     Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+
+std::wstring GetIniPath()
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+        return L"QRScreen.ini";
+
+    std::wstring result(path, length);
+    const size_t slash = result.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        result.resize(slash + 1);
+    else
+        result.clear();
+    result += L"QRScreen.ini";
+    return result;
+}
+
+void SaveHotkeySettings(UINT modifiers, UINT vk)
+{
+    const std::wstring path = GetIniPath();
+    const std::wstring modifierText = std::to_wstring(modifiers);
+    const std::wstring keyText = std::to_wstring(vk);
+    WritePrivateProfileStringW(L"Hotkey", L"Modifiers", modifierText.c_str(), path.c_str());
+    WritePrivateProfileStringW(L"Hotkey", L"Key", keyText.c_str(), path.c_str());
+}
+
+std::wstring GetKeyName(UINT vk)
+{
+    if (vk == VK_SNAPSHOT)
+        return L"Print Screen";
+
+    const UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    LONG keyData = static_cast<LONG>(scanCode << 16);
+    switch (vk) {
+    case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END:
+    case VK_PRIOR: case VK_NEXT: case VK_LEFT: case VK_RIGHT:
+    case VK_UP: case VK_DOWN: case VK_DIVIDE: case VK_NUMLOCK:
+        keyData |= (1L << 24);
+        break;
+    default:
+        break;
+    }
+
+    wchar_t name[128]{};
+    if (GetKeyNameTextW(keyData, name, static_cast<int>(std::size(name))) > 0)
+        return name;
+    return L"Key " + std::to_wstring(vk);
+}
+
+std::wstring FormatHotkey(UINT modifiers, UINT vk)
+{
+    if (vk == 0)
+        return L"Нажмите сочетание клавиш";
+
+    std::wstring result;
+    if (modifiers & MOD_CONTROL) result += L"Ctrl + ";
+    if (modifiers & MOD_ALT)     result += L"Alt + ";
+    if (modifiers & MOD_SHIFT)   result += L"Shift + ";
+    if (modifiers & MOD_WIN)     result += L"Win + ";
+    result += GetKeyName(vk);
+    return result;
+}
+
+void UpdateTrayIconTooltip()
+{
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = gMainWindow;
+    nid.uID = kTrayIconId;
+    nid.uFlags = NIF_TIP;
+    const std::wstring tip = gRegisteredHotkeyId
+        ? L"QR Screen — " + FormatHotkey(gHotkeyModifiers, gHotkeyVk)
+        : L"QR Screen — горячая клавиша не назначена";
+    wcscpy_s(nid.szTip, tip.c_str());
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+void ShowTrayBalloon(const std::wstring& title, const std::wstring& message,
+                     DWORD icon = NIIF_WARNING)
+{
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = gMainWindow;
+    nid.uID = kTrayIconId;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = icon;
+    nid.uTimeout = 6000;
+    wcscpy_s(nid.szInfoTitle, title.c_str());
+    wcscpy_s(nid.szInfo, message.c_str());
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+bool IsModifierKey(UINT vk)
+{
+    return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+           vk == VK_LSHIFT || vk == VK_RSHIFT ||
+           vk == VK_LCONTROL || vk == VK_RCONTROL ||
+           vk == VK_LMENU || vk == VK_RMENU ||
+           vk == VK_LWIN || vk == VK_RWIN;
+}
+
+bool IsValidHotkey(UINT modifiers, UINT vk)
+{
+    constexpr UINT allowedModifiers = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN;
+    if (vk == 0 || vk > 0xFF || IsModifierKey(vk) ||
+        vk == VK_ESCAPE || vk == VK_RETURN || (modifiers & ~allowedModifiers) != 0)
+        return false;
+
+    // Avoid globally stealing ordinary typing keys. An unmodified key is
+    // permitted only for Print Screen, which is the default screenshot key.
+    return modifiers != 0 || vk == VK_SNAPSHOT;
+}
+
+bool ApplyGlobalHotkey(UINT modifiers, UINT vk, DWORD* errorCode = nullptr)
+{
+    if (!IsValidHotkey(modifiers, vk)) {
+        if (errorCode) *errorCode = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+
+    if (gRegisteredHotkeyId && modifiers == gHotkeyModifiers && vk == gHotkeyVk) {
+        if (errorCode) *errorCode = ERROR_SUCCESS;
+        return true;
+    }
+
+    const UINT newId = (gRegisteredHotkeyId == kHotkeyIdA) ? kHotkeyIdB : kHotkeyIdA;
+    if (!RegisterHotKey(gMainWindow, static_cast<int>(newId),
+                        modifiers | MOD_NOREPEAT, vk)) {
+        if (errorCode) *errorCode = GetLastError();
+        return false;
+    }
+
+    // Register the new combination first. If it is busy, the current one
+    // remains active and the user can choose another without losing it.
+    if (gRegisteredHotkeyId)
+        UnregisterHotKey(gMainWindow, static_cast<int>(gRegisteredHotkeyId));
+
+    gRegisteredHotkeyId = newId;
+    gHotkeyModifiers = modifiers;
+    gHotkeyVk = vk;
+    UpdateTrayIconTooltip();
+    if (errorCode) *errorCode = ERROR_SUCCESS;
+    return true;
+}
+
+bool RegisterStartupHotkey()
+{
+    const std::wstring ini = GetIniPath();
+    const UINT preferredModifiers = GetPrivateProfileIntW(
+        L"Hotkey", L"Modifiers", 0, ini.c_str());
+    const UINT preferredVk = GetPrivateProfileIntW(
+        L"Hotkey", L"Key", VK_SNAPSHOT, ini.c_str());
+
+    if (IsValidHotkey(preferredModifiers, preferredVk) &&
+        RegisterHotKey(gMainWindow, static_cast<int>(kHotkeyIdA),
+                       preferredModifiers | MOD_NOREPEAT, preferredVk)) {
+        gRegisteredHotkeyId = kHotkeyIdA;
+        gHotkeyModifiers = preferredModifiers;
+        gHotkeyVk = preferredVk;
+        UpdateTrayIconTooltip();
+        return true;
+    }
+
+    const DWORD preferredError = IsValidHotkey(preferredModifiers, preferredVk)
+        ? GetLastError() : ERROR_INVALID_PARAMETER;
+    struct Candidate { UINT modifiers; UINT vk; };
+    const Candidate alternatives[] = {
+        { 0, VK_SNAPSHOT },
+        { MOD_CONTROL | MOD_ALT, VK_F11 },
+        { MOD_CONTROL | MOD_ALT, VK_F10 },
+        { MOD_CONTROL | MOD_ALT, VK_F9 },
+        { MOD_CONTROL | MOD_ALT, VK_F8 },
+        { MOD_CONTROL | MOD_SHIFT, VK_F11 },
+        { MOD_CONTROL | MOD_SHIFT, VK_F10 },
+        { MOD_CONTROL | MOD_SHIFT, VK_F9 }
+    };
+
+    for (const Candidate& candidate : alternatives) {
+        if (candidate.modifiers == preferredModifiers && candidate.vk == preferredVk)
+            continue;
+        if (!RegisterHotKey(gMainWindow, static_cast<int>(kHotkeyIdA),
+                            candidate.modifiers | MOD_NOREPEAT, candidate.vk))
+            continue;
+
+        gRegisteredHotkeyId = kHotkeyIdA;
+        gHotkeyModifiers = candidate.modifiers;
+        gHotkeyVk = candidate.vk;
+        SaveHotkeySettings(gHotkeyModifiers, gHotkeyVk);
+        UpdateTrayIconTooltip();
+
+        const std::wstring oldName = FormatHotkey(preferredModifiers, preferredVk);
+        const std::wstring newName = FormatHotkey(gHotkeyModifiers, gHotkeyVk);
+        std::wstring message;
+        if (preferredError == ERROR_HOTKEY_ALREADY_REGISTERED) {
+            message = oldName + L" занято другим приложением. Для QR Screen автоматически назначено " +
+                      newName + L". Сочетание можно изменить в настройках.";
+        } else {
+            message = L"Не удалось зарегистрировать " + oldName + L". Для QR Screen назначено " +
+                      newName + L". Сочетание можно изменить в настройках.";
+        }
+        ShowTrayBalloon(L"QR Screen: изменена горячая клавиша", message);
+        return true;
+    }
+
+    gRegisteredHotkeyId = 0;
+    UpdateTrayIconTooltip();
+    ShowTrayBalloon(L"QR Screen: нет горячей клавиши",
+        L"Не удалось зарегистрировать сочетание клавиш. Запуск распознавания доступен через меню значка в трее.");
+    return false;
+}
+
+LRESULT CALLBACK HotkeyBoxWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message) {
+    case WM_GETDLGCODE:
+        return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
+
+    case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
+        return 0;
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        const UINT vk = static_cast<UINT>(wParam);
+        if (IsModifierKey(vk) || vk == VK_ESCAPE || vk == VK_RETURN)
+            return 0;
+
+        UINT modifiers = 0;
+        if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= MOD_CONTROL;
+        if (GetKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
+        if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
+        if ((GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+            (GetAsyncKeyState(VK_RWIN) & 0x8000)) modifiers |= MOD_WIN;
+
+        gPendingHotkeyModifiers = modifiers;
+        gPendingHotkeyVk = vk;
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    }
+
+    case WM_CHAR:
+        return 0;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        DrawEdge(dc, &rc, (GetFocus() == hwnd) ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+        InflateRect(&rc, -8, -2);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+        const std::wstring label = FormatHotkey(gPendingHotkeyModifiers, gPendingHotkeyVk);
+        DrawTextW(dc, label.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (GetFocus() == hwnd) {
+            RECT focus = rc;
+            InflateRect(&focus, -2, -3);
+            DrawFocusRect(dc, &focus);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message) {
+    case WM_CREATE: {
+        gSettingsWindow = hwnd;
+        CreateWindowExW(0, L"STATIC", L"Текущее сочетание:",
+            WS_CHILD | WS_VISIBLE, 18, 16, 390, 20, hwnd, nullptr, gInstance, nullptr);
+        const std::wstring current = gRegisteredHotkeyId
+            ? FormatHotkey(gHotkeyModifiers, gHotkeyVk)
+            : L"Не назначено";
+        CreateWindowExW(0, L"STATIC", current.c_str(),
+            WS_CHILD | WS_VISIBLE, 150, 16, 270, 20, hwnd, nullptr, gInstance, nullptr);
+        CreateWindowExW(0, L"STATIC", L"Нажмите новое сочетание в поле ниже:",
+            WS_CHILD | WS_VISIBLE, 18, 47, 400, 20, hwnd, nullptr, gInstance, nullptr);
+        gHotkeyBox = CreateWindowExW(0, kHotkeyBoxClass, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 18, 72, 402, 38,
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsHotkeyBox)),
+            gInstance, nullptr);
+        CreateWindowExW(0, L"STATIC",
+            L"Ctrl, Alt, Shift и Win поддерживаются; без модификатора доступен только Print Screen.\n"
+            L"Esc и Enter зарезервированы. Проверяются глобальные сочетания Windows.",
+            WS_CHILD | WS_VISIBLE, 18, 116, 402, 34, hwnd, nullptr, gInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"По умолчанию: Print Screen",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            18, 158, 184, 30, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsDefault)), gInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Сохранить",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            244, 158, 84, 30, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsSave)), gInstance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Отмена",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            336, 158, 84, 30, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCancel)), gInstance, nullptr);
+        SetFocus(gHotkeyBox);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case kSettingsDefault:
+            gPendingHotkeyModifiers = 0;
+            gPendingHotkeyVk = VK_SNAPSHOT;
+            if (gHotkeyBox) InvalidateRect(gHotkeyBox, nullptr, TRUE);
+            return 0;
+
+        case kSettingsSave: {
+            DWORD error = ERROR_SUCCESS;
+            if (!ApplyGlobalHotkey(gPendingHotkeyModifiers, gPendingHotkeyVk, &error)) {
+                const wchar_t* message = (error == ERROR_HOTKEY_ALREADY_REGISTERED)
+                    ? L"Это сочетание уже занято (зарегистрировано другой программой).\nВыберите другое сочетание клавиш."
+                    : (error == ERROR_INVALID_PARAMETER)
+                        ? L"Для клавиш кроме Print Screen нужен модификатор Ctrl, Alt, Shift или Win.\nEsc и Enter зарезервированы."
+                        : L"Не удалось зарегистрировать это сочетание клавиш.\nПопробуйте другое сочетание.";
+                MessageBoxW(hwnd, message, L"QR Screen", MB_OK | MB_ICONWARNING);
+                if (gHotkeyBox) SetFocus(gHotkeyBox);
+                return 0;
+            }
+            SaveHotkeySettings(gHotkeyModifiers, gHotkeyVk);
+            ShowTrayBalloon(L"QR Screen", L"Горячая клавиша: " +
+                FormatHotkey(gHotkeyModifiers, gHotkeyVk), NIIF_INFO);
+            DestroyWindow(hwnd);
+            return 0;
+        }
+
+        case kSettingsCancel:
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        gSettingsWindow = nullptr;
+        gHotkeyBox = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+bool EnsureSettingsClasses()
+{
+    WNDCLASSEXW box{};
+    box.cbSize = sizeof(box);
+    box.lpfnWndProc = HotkeyBoxWndProc;
+    box.hInstance = gInstance;
+    box.hCursor = LoadCursorW(nullptr, IDC_HAND);
+    box.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+    box.lpszClassName = kHotkeyBoxClass;
+    if (!RegisterClassExW(&box) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return false;
+
+    WNDCLASSEXW settings{};
+    settings.cbSize = sizeof(settings);
+    settings.lpfnWndProc = SettingsWndProc;
+    settings.hInstance = gInstance;
+    settings.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    settings.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
+    settings.lpszClassName = kSettingsClass;
+    if (!RegisterClassExW(&settings) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return false;
+    return true;
+}
+
+void ShowSettingsWindow()
+{
+    if (gSettingsWindow && IsWindow(gSettingsWindow)) {
+        ShowWindow(gSettingsWindow, SW_SHOWNORMAL);
+        SetForegroundWindow(gSettingsWindow);
+        if (gHotkeyBox) SetFocus(gHotkeyBox);
+        return;
+    }
+    if (!EnsureSettingsClasses()) {
+        MessageBoxW(gMainWindow, L"Не удалось создать окно настроек.",
+                    L"QR Screen", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    gPendingHotkeyModifiers = gHotkeyModifiers;
+    gPendingHotkeyVk = gHotkeyVk;
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_DLGMODALFRAME,
+        kSettingsClass, L"Настройки QR Screen",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, 456, 235,
+        gMainWindow, nullptr, gInstance, nullptr);
+    if (!window) {
+        MessageBoxW(gMainWindow, L"Не удалось открыть настройки.",
+                    L"QR Screen", MB_OK | MB_ICONERROR);
+        return;
+    }
+    ShowWindow(window, SW_SHOWNORMAL);
+    UpdateWindow(window);
+    SetForegroundWindow(window);
+    if (gHotkeyBox) SetFocus(gHotkeyBox);
 }
 
 void DrawDimLayer(HDC target, int width, int height)
@@ -444,7 +878,7 @@ LRESULT CALLBACK SelectorWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
         return 1;
 
     case WM_SETCURSOR:
-        SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+        SetCursor(LoadCursorW(nullptr, (gDragging || !gHasSelection) ? IDC_CROSS : IDC_ARROW));
         return TRUE;
 
     case WM_PAINT: {
@@ -504,8 +938,10 @@ LRESULT CALLBACK SelectorWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
             if (SelectionWidth() >= 12 && SelectionHeight() >= 12) {
                 gHasSelection = true;
                 CreateRecognizeButton(hwnd);
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             } else {
                 gHasSelection = false;
+                SetCursor(LoadCursorW(nullptr, IDC_CROSS));
             }
             InvalidateRect(hwnd, nullptr, FALSE);
         }
@@ -611,18 +1047,38 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
         const bool keyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
         const bool keyUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
-        if (key->vkCode == VK_SNAPSHOT) {
+        // RegisterHotKey reserves the selected combination so Windows can
+        // report conflicts. The low-level hook then suppresses that key from
+        // reaching other screenshot tools and starts our capture directly.
+        // Do not swallow it while the settings window is open: the user must
+        // be able to record the current combination in the hotkey editor.
+        if (gRegisteredHotkeyId && !gSettingsWindow && key->vkCode == gHotkeyVk) {
             if (keyDown) {
-                if (!gPrintScreenDown) {
-                    gPrintScreenDown = true;
-                    if (gMainWindow && !gSelector)
-                        PostMessageW(gMainWindow, kCaptureMessage, 0, 0);
+                if (!gCustomHotkeyKeyDown) {
+                    gCustomHotkeyKeyDown = true;
+                    UINT modifiers = 0;
+                    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) modifiers |= MOD_CONTROL;
+                    if (GetAsyncKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
+                    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
+                    if ((GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+                        (GetAsyncKeyState(VK_RWIN) & 0x8000)) modifiers |= MOD_WIN;
+
+                    if (modifiers == gHotkeyModifiers) {
+                        gSuppressHotkeyKeyUp = true;
+                        if (gMainWindow && !gSelector)
+                            PostMessageW(gMainWindow, kCaptureMessage, 0, 0);
+                        return 1;
+                    }
                 }
-                return 1; // prevent Windows/other screenshot tools from taking over PrtSc
+                if (gSuppressHotkeyKeyUp)
+                    return 1;
             }
             if (keyUp) {
-                gPrintScreenDown = false;
-                return 1;
+                gCustomHotkeyKeyDown = false;
+                if (gSuppressHotkeyKeyUp) {
+                    gSuppressHotkeyKeyUp = false;
+                    return 1;
+                }
             }
         }
 
@@ -674,6 +1130,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_DESTROY:
         if (gSelector)
             DestroySelector();
+        if (gSettingsWindow)
+            DestroyWindow(gSettingsWindow);
+        if (gRegisteredHotkeyId) {
+            UnregisterHotKey(hwnd, static_cast<int>(gRegisteredHotkeyId));
+            gRegisteredHotkeyId = 0;
+        }
         RemoveTrayIcon();
         if (gKeyboardHook) {
             UnhookWindowsHookEx(gKeyboardHook);
@@ -736,12 +1198,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int)
     }
 
     AddTrayIcon();
+    RegisterStartupHotkey();
     gKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
                                       gInstance, 0);
     if (!gKeyboardHook) {
         RemoveTrayIcon();
         MessageBoxW(nullptr,
-            L"Не удалось зарегистрировать глобальный перехват клавиши Print Screen.\n"
+            L"Не удалось установить обработчик клавиш Enter и Esc.\n"
             L"Проверьте, не запрещает ли это защитное ПО.",
             L"QR Screen", MB_OK | MB_ICONERROR);
         DestroyWindow(gMainWindow);
@@ -751,6 +1214,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int)
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (gSettingsWindow && IsDialogMessageW(gSettingsWindow, &msg))
+            continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
