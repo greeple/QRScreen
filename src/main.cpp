@@ -1,16 +1,13 @@
 #define WINVER 0x0A00
 #define _WIN32_WINNT 0x0A00
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-
 #include <windows.h>
 #include <shellapi.h>
 #include <windowsx.h>
 #include <wingdi.h>
 
-#include <ZXing/ReadBarcode.h>
-#include <ZXing/BarcodeFormat.h>
-#include <ZXing/ImageView.h>
+#include <ReadBarcode.h>
+#include <BarcodeFormat.h>
+#include <ImageView.h>
 
 #include <algorithm>
 #include <cstdint>
