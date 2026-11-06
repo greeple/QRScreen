@@ -46,6 +46,9 @@ FetchContent_MakeAvailable(zxing)
 
 add_executable(QRScreen WIN32 src/main.cpp)
 target_compile_definitions(QRScreen PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+# ZXing::ZXing exports core/src and the generated core build directory as
+# include paths. Its public headers are included by filename (for example,
+# <ReadBarcode.h>), not with an additional <ZXing/> path component.
 target_link_libraries(QRScreen PRIVATE ZXing::ZXing user32 gdi32 shell32 msimg32)
 
 if(MSVC)
