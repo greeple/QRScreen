@@ -589,20 +589,20 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
         case kSettingsSave: {
             DWORD error = ERROR_SUCCESS;
             if (!ApplyGlobalHotkey(gPendingHotkeyModifiers, gPendingHotkeyVk, &error)) {
-                const wchar_t* message = (error == ERROR_HOTKEY_ALREADY_REGISTERED)
+                const wchar_t* warningText = (error == ERROR_HOTKEY_ALREADY_REGISTERED)
                     ? L"Это сочетание уже занято другой программой.\r\nВыберите другое сочетание клавиш."
                     : (error == ERROR_INVALID_PARAMETER)
                         ? L"Для клавиш кроме Print Screen нужен модификатор Ctrl, Alt, Shift или Win.\r\nEsc и Enter зарезервированы."
                         : L"Не удалось зарегистрировать это сочетание клавиш.\r\nПопробуйте другое сочетание.";
-                MessageBoxW(hwnd, message, L"QR Screen",
+                MessageBoxW(hwnd, warningText, L"QR Screen",
                             MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
                 if (gHotkeyBox) SetFocus(gHotkeyBox);
                 return 0;
             }
             SaveHotkeySettings(gHotkeyModifiers, gHotkeyVk);
-            const std::wstring message = L"Горячая клавиша установлена: " +
+            const std::wstring confirmationText = L"Горячая клавиша установлена: " +
                 FormatHotkey(gHotkeyModifiers, gHotkeyVk);
-            MessageBoxW(hwnd, message.c_str(), L"QR Screen",
+            MessageBoxW(hwnd, confirmationText.c_str(), L"QR Screen",
                         MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
             DestroyWindow(hwnd);
             return 0;
@@ -676,8 +676,13 @@ void ShowSettingsWindow()
     monitorInfo.cbSize = sizeof(monitorInfo);
     GetMonitorInfoW(monitor, &monitorInfo);
     const RECT work = monitorInfo.rcWork;
-    const int windowX = work.left + std::max(0, (work.right - work.left - windowWidth) / 2);
-    const int windowY = work.top + std::max(0, (work.bottom - work.top - windowHeight) / 2);
+    // RECT coordinates are LONG (WinAPI); keep all std::max operands the same type.
+    const LONG offsetX = std::max<LONG>(0L,
+        (work.right - work.left - static_cast<LONG>(windowWidth)) / 2);
+    const LONG offsetY = std::max<LONG>(0L,
+        (work.bottom - work.top - static_cast<LONG>(windowHeight)) / 2);
+    const int windowX = static_cast<int>(work.left + offsetX);
+    const int windowY = static_cast<int>(work.top + offsetY);
 
     HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_DLGMODALFRAME,
         kSettingsClass, L"Настройки QR Screen",
