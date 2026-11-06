@@ -59,10 +59,15 @@ HFONT gButtonFont = nullptr;
 RECT NormalizeRect(POINT a, POINT b)
 {
     RECT r{};
-    r.left = std::clamp(std::min(a.x, b.x), 0, gScreenWidth);
-    r.top = std::clamp(std::min(a.y, b.y), 0, gScreenHeight);
-    r.right = std::clamp(std::max(a.x, b.x), 0, gScreenWidth);
-    r.bottom = std::clamp(std::max(a.y, b.y), 0, gScreenHeight);
+    // POINT/RECT coordinates are LONG in WinAPI. Keep all std::clamp
+    // arguments the same type; mixing LONG with int prevents template
+    // argument deduction in MSVC.
+    const LONG maxX = static_cast<LONG>(gScreenWidth);
+    const LONG maxY = static_cast<LONG>(gScreenHeight);
+    r.left = std::clamp<LONG>(std::min(a.x, b.x), LONG{0}, maxX);
+    r.top = std::clamp<LONG>(std::min(a.y, b.y), LONG{0}, maxY);
+    r.right = std::clamp<LONG>(std::max(a.x, b.x), LONG{0}, maxX);
+    r.bottom = std::clamp<LONG>(std::max(a.y, b.y), LONG{0}, maxY);
     return r;
 }
 
